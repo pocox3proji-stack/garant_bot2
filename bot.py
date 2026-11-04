@@ -44,16 +44,14 @@ logger = logging.getLogger("gift_guarantor")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# A single SQLite connection is used on the bot's one asyncio event loop.
 db = sqlite3.connect(DB_PATH, timeout=30)
 db.row_factory = sqlite3.Row
 db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA foreign_keys=ON")
 db.execute("PRAGMA busy_timeout=30000")
 
-
 # ---------------------------------------------------------------------------
-# Database and migrations. Existing deals.db data is preserved.
+# Database and migrations
 # ---------------------------------------------------------------------------
 
 db.execute(
@@ -229,10 +227,7 @@ async def admin_notice(text: str) -> None:
 
 
 def payment_instructions(method: str, code: str, amount: int) -> str:
-    header = (
-        f"Сделка: {code}\n"
-        f"Сумма: {format_rub(amount)}\n\n"
-    )
+    header = f"Сделка: {code}\nСумма: {format_rub(amount)}\n\n"
 
     if method == "YOOMONEY":
         if not YOOMONEY_WALLET:
@@ -250,8 +245,8 @@ def payment_instructions(method: str, code: str, amount: int) -> str:
             return (
                 header
                 + "Оплата картой пока не настроена: реквизиты ещё не добавлены "
-                  "администратором. Не переводите деньги, пока бот не покажет "
-                  "платёжные реквизиты."
+                "администратором. Не переводите деньги, пока бот не покажет "
+                "платёжные реквизиты."
             )
         return (
             header
@@ -265,7 +260,7 @@ def payment_instructions(method: str, code: str, amount: int) -> str:
             return (
                 header
                 + "Криптовалютные реквизиты пока не настроены. "
-                  "Не отправляйте средства."
+                "Не отправляйте средства."
             )
         asset = "USDT (Jetton, сеть TON)" if method == "USDT" else "TON"
         return (
@@ -273,8 +268,8 @@ def payment_instructions(method: str, code: str, amount: int) -> str:
             + f"Способ оплаты: {asset}\n"
             + f"Кошелёк получателя:\n{TON_WALLET_ADDRESS}\n\n"
             + "Перед отправкой убедитесь, что выбран правильный актив и сеть. "
-              "Сохраните подтверждение перевода. Оплата будет подтверждена "
-              "администратором после проверки поступления."
+            "Сохраните подтверждение перевода. Оплата будет подтверждена "
+            "администратором после проверки поступления."
         )
 
     return header + "Неизвестный способ оплаты."
@@ -396,6 +391,74 @@ async def text_handler(message: Message):
     text = (message.text or "").strip()
     user_id = message.from_user.id
 
+    # First check whether this message is a valid code for a new deal.
+    # This prevents an old pending-price entry from swallowing a new deal code.
+    code = safe_code(text)
+
+    if code:
+        deal = get_deal(code)
+
+        if deal and deal["status"] == "waiting" and deal["seller"] is None:
+            if deal["buyer"] == user_id:
+                await message.answer(
+                    "Вы создали эту сделку и не можете присоединиться как продавец."
+                )
+                return
+
+            pending = db.execute(
+                "SELECT deal_code FROM pending_price WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+            if pending:
+                await message.answer(
+                    f"Сначала укажите цену по сделке {pending['deal_code']}."
+                )
+                return
+
+            cur = db.execute(
+                "UPDATE deals SET seller = ?, status = 'setting_price' "
+                "WHERE code = ? AND seller IS NULL AND status = 'waiting'",
+                (user_id, code),
+            )
+
+            if cur.rowcount != 1:
+                db.rollback()
+                await message.answer(
+                    "Не удалось присоединиться: сделка уже занята."
+                )
+                return
+
+            db.execute(
+                "INSERT INTO pending_price (user_id, deal_code) VALUES (?, ?)",
+                (user_id, code),
+            )
+            db.commit()
+
+            # Send the price request directly to the seller first.
+            await message.answer(
+                f"🤝 Вы успешно присоединились к сделке {code}!\n\n"
+                "💰 Теперь отправьте стоимость товара в целых рублях.\n"
+                "Например: 15000"
+            )
+
+            await notify_safely(
+                deal["buyer"],
+                f"🤝 Продавец присоединился к сделке {code}.\n"
+                "Ожидается, что продавец укажет цену."
+            )
+            return
+
+        if not deal:
+            pending = db.execute(
+                "SELECT deal_code FROM pending_price WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if not pending:
+                await message.answer("Сделка с таким кодом не найдена.")
+                return
+
+    # If this is not a joinable new deal code, process the pending price.
     pending = db.execute(
         "SELECT deal_code FROM pending_price WHERE user_id = ?",
         (user_id,),
@@ -405,62 +468,10 @@ async def text_handler(message: Message):
         await process_price(message, pending["deal_code"], text)
         return
 
-    code = safe_code(text)
-    if not code:
-        await message.answer(
-            "Используйте кнопки меню. Для присоединения отправьте "
-            "8-значный код сделки.",
-            reply_markup=main_menu(user_id),
-        )
-        return
-
-    deal = get_deal(code)
-    if not deal:
-        await message.answer("Сделка с таким кодом не найдена.")
-        return
-    if deal["buyer"] == user_id:
-        await message.answer(
-            "Вы создали эту сделку и не можете присоединиться как продавец."
-        )
-        return
-    if deal["status"] != "waiting" or deal["seller"] is not None:
-        await message.answer("Эта сделка уже занята или недоступна.")
-        return
-
-    pending_other = db.execute(
-        "SELECT deal_code FROM pending_price WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-    if pending_other:
-        await message.answer(
-            f"Сначала укажите цену по сделке {pending_other['deal_code']}."
-        )
-        return
-
-    cur = db.execute(
-        "UPDATE deals SET seller = ?, status = 'setting_price' "
-        "WHERE code = ? AND seller IS NULL AND status = 'waiting'",
-        (user_id, code),
-    )
-    if cur.rowcount != 1:
-        db.rollback()
-        await message.answer("Не удалось присоединиться: сделка уже занята.")
-        return
-
-    db.execute(
-        "INSERT OR REPLACE INTO pending_price (user_id, deal_code) "
-        "VALUES (?, ?)",
-        (user_id, code),
-    )
-    db.commit()
-
     await message.answer(
-        f"🤝 Вы присоединились к сделке {code}.\n\n"
-        "Теперь отправьте стоимость товара в целых рублях. Например: 15000"
-    )
-    await notify_safely(
-        deal["buyer"],
-        f"🤝 Продавец присоединился к сделке {code}. Ожидается цена."
+        "Используйте кнопки меню. Для присоединения отправьте "
+        "8-значный код сделки.",
+        reply_markup=main_menu(user_id),
     )
 
 
@@ -655,7 +666,7 @@ async def buyer_paid(call: CallbackQuery):
 
 # ---------------------------------------------------------------------------
 # Participant's deal list and help
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 STATUS_LABELS = {
     "waiting": "Ожидается продавец",
@@ -787,8 +798,7 @@ async def admin_transition(
         return None
 
     cur = db.execute(
-        "UPDATE deals SET status = ? "
-        "WHERE code = ? AND status = ?",
+        "UPDATE deals SET status = ? WHERE code = ? AND status = ?",
         (new_status, code, expected_status),
     )
     db.commit()
@@ -995,9 +1005,7 @@ async def pause_deal(call: CallbackQuery):
         await call.answer("Не удалось изменить статус.", show_alert=True)
         return
 
-    db.execute(
-        "DELETE FROM pending_price WHERE deal_code = ?", (code,)
-    )
+    db.execute("DELETE FROM pending_price WHERE deal_code = ?", (code,))
     db.commit()
 
     for uid in (deal["buyer"], deal["seller"]):
