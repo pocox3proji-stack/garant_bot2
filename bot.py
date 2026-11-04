@@ -21,4 +21,3 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 deals = {}
-deal
