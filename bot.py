@@ -24,8 +24,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 7262162132
 DB_PATH = os.getenv("DB_PATH", "deals.db")
 
-# Fill these Railway Variables when you are ready to accept real payments.
 CARD_PAYMENT_DETAILS = os.getenv("CARD_PAYMENT_DETAILS", "").strip()
+YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "").strip()
 TON_WALLET_ADDRESS = os.getenv(
     "TON_WALLET_ADDRESS",
     "UQDxj9An8wquQrRspHI_SdhKK9rKLXon4-4xR7X64nQoJMCR",
@@ -80,7 +80,6 @@ ensure_column("amount_rub", "INTEGER")
 ensure_column("resume_status", "TEXT")
 ensure_column("payment_method", "TEXT")
 
-# Pending seller price input survives Railway restarts.
 db.execute(
     """
     CREATE TABLE IF NOT EXISTS pending_price (
@@ -89,8 +88,6 @@ db.execute(
     )
     """
 )
-
-# A pending join is not necessary: an 8-character deal code can be sent directly.
 db.commit()
 
 
@@ -142,9 +139,26 @@ def confirmation_keyboard(code: str) -> InlineKeyboardMarkup:
 
 def payment_keyboard(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Банковская карта", callback_data=f"pay:CARD:{code}")],
-        [InlineKeyboardButton(text="💵 USDT (сеть TON)", callback_data=f"pay:USDT:{code}")],
-        [InlineKeyboardButton(text="💎 TON", callback_data=f"pay:TON:{code}")],
+        [InlineKeyboardButton(
+            text="💳 Банковская карта", callback_data=f"pay:CARD:{code}"
+        )],
+        [InlineKeyboardButton(
+            text="🟡 ЮMoney", callback_data=f"pay:YOOMONEY:{code}"
+        )],
+        [InlineKeyboardButton(
+            text="💵 USDT (сеть TON)", callback_data=f"pay:USDT:{code}"
+        )],
+        [InlineKeyboardButton(
+            text="💎 TON", callback_data=f"pay:TON:{code}"
+        )],
+    ])
+
+
+def buyer_paid_keyboard(code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Я оплатил", callback_data=f"buyer_paid:{code}"
+        )]
     ])
 
 
@@ -199,7 +213,9 @@ def admin_deal_keyboard(deal: sqlite3.Row) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def notify_safely(user_id: Optional[int], text: str, reply_markup=None) -> None:
+async def notify_safely(
+    user_id: Optional[int], text: str, reply_markup=None
+) -> None:
     if not user_id:
         return
     try:
@@ -217,6 +233,18 @@ def payment_instructions(method: str, code: str, amount: int) -> str:
         f"Сделка: {code}\n"
         f"Сумма: {format_rub(amount)}\n\n"
     )
+
+    if method == "YOOMONEY":
+        if not YOOMONEY_WALLET:
+            return header + "Оплата через ЮMoney пока не настроена."
+        return (
+            header
+            + "🟡 Перевод через ЮMoney\n\n"
+            + f"Номер кошелька:\n{YOOMONEY_WALLET}\n\n"
+            + "Переведите точную сумму на указанный кошелёк. "
+            + "После перевода нажмите кнопку «Я оплатил»."
+        )
+
     if method == "CARD":
         if not CARD_PAYMENT_DETAILS:
             return (
@@ -533,7 +561,7 @@ async def reject_price(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("pay:"))
 async def select_payment(call: CallbackQuery):
     parts = call.data.split(":")
-    if len(parts) != 3 or parts[1] not in ("CARD", "USDT", "TON"):
+    if len(parts) != 3 or parts[1] not in ("CARD", "YOOMONEY", "USDT", "TON"):
         await call.answer("Некорректный способ оплаты.", show_alert=True)
         return
 
@@ -559,16 +587,21 @@ async def select_payment(call: CallbackQuery):
         return
 
     instructions = payment_instructions(method, code, deal["amount_rub"])
-    await call.message.answer(instructions)
+    await call.message.answer(
+        instructions,
+        reply_markup=(
+            buyer_paid_keyboard(code)
+            if method == "YOOMONEY" and YOOMONEY_WALLET
+            else None
+        ),
+    )
 
     if method == "CARD" and not CARD_PAYMENT_DETAILS:
-        await call.answer(
-            "Реквизиты карты ещё не настроены.", show_alert=True
-        )
+        await call.answer("Реквизиты карты ещё не настроены.", show_alert=True)
+    elif method == "YOOMONEY" and not YOOMONEY_WALLET:
+        await call.answer("Кошелёк ЮMoney ещё не настроен.", show_alert=True)
     elif method in ("USDT", "TON") and not TON_WALLET_ADDRESS:
-        await call.answer(
-            "Криптокошелёк ещё не настроен.", show_alert=True
-        )
+        await call.answer("Криптокошелёк ещё не настроен.", show_alert=True)
     else:
         await call.answer("Способ оплаты выбран")
 
@@ -584,9 +617,45 @@ async def select_payment(call: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data.startswith("buyer_paid:"))
+async def buyer_paid(call: CallbackQuery):
+    code = call.data.split(":", 1)[1]
+    deal = get_deal(code)
+
+    if not deal or deal["buyer"] != call.from_user.id:
+        await call.answer("Нет доступа к этой сделке.", show_alert=True)
+        return
+
+    if deal["status"] != "awaiting_payment":
+        await call.answer("Сейчас нельзя отметить оплату.", show_alert=True)
+        return
+
+    if deal["payment_method"] != "YOOMONEY":
+        await call.answer(
+            "Для этой сделки выбран другой способ оплаты.",
+            show_alert=True,
+        )
+        return
+
+    await admin_notice(
+        f"🔔 Покупатель сообщает об оплате через ЮMoney.\n"
+        f"Сделка: {code}\n"
+        f"Сумма: {format_rub(deal['amount_rub'])}\n"
+        f"Покупатель: {deal['buyer']}\n\n"
+        "Проверь поступление денег в ЮMoney. "
+        "Если деньги действительно поступили, подтверди оплату в админ-панели."
+    )
+
+    await call.message.answer(
+        "✅ Информация об оплате отправлена гаранту. "
+        "Ожидайте проверки поступления денег."
+    )
+    await call.answer("Уведомление отправлено")
+
+
 # ---------------------------------------------------------------------------
 # Participant's deal list and help
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 
 STATUS_LABELS = {
     "waiting": "Ожидается продавец",
@@ -711,7 +780,10 @@ async def admin_transition(
         await call.answer("Сделка не найдена.", show_alert=True)
         return None
     if deal["status"] == "paused":
-        await call.answer("Сделка приостановлена. Сначала возобнови её.", show_alert=True)
+        await call.answer(
+            "Сделка приостановлена. Сначала возобнови её.",
+            show_alert=True,
+        )
         return None
 
     cur = db.execute(
@@ -817,7 +889,10 @@ async def admin_remind_buyer(call: CallbackQuery):
     code = call.data.split(":", 1)[1]
     deal = get_deal(code)
     if not deal or deal["status"] != "awaiting_buyer_gift":
-        await call.answer("Сделка не ожидает подтверждения покупателя.", show_alert=True)
+        await call.answer(
+            "Сделка не ожидает подтверждения покупателя.",
+            show_alert=True,
+        )
         return
     await notify_safely(
         deal["buyer"],
@@ -845,7 +920,10 @@ async def buyer_confirm_gift(call: CallbackQuery):
     )
     db.commit()
     if cur.rowcount != 1:
-        await call.answer("Подтверждение уже обработано или недоступно.", show_alert=True)
+        await call.answer(
+            "Подтверждение уже обработано или недоступно.",
+            show_alert=True,
+        )
         return
 
     await call.message.answer(
@@ -858,7 +936,8 @@ async def buyer_confirm_gift(call: CallbackQuery):
     )
     await admin_notice(
         f"Покупатель подтвердил получение подарка по сделке {code}. "
-        "После фактической выплаты продавцу нажми «Выплата продавцу отправлена — завершить»."
+        "После фактической выплаты продавцу нажми "
+        "«Выплата продавцу отправлена — завершить»."
     )
     await call.answer("Получение подтверждено")
 
@@ -900,7 +979,10 @@ async def pause_deal(call: CallbackQuery):
         await call.answer("Сделка уже приостановлена.")
         return
     if deal["status"] == "completed":
-        await call.answer("Завершённую сделку нельзя приостановить.", show_alert=True)
+        await call.answer(
+            "Завершённую сделку нельзя приостановить.",
+            show_alert=True,
+        )
         return
 
     cur = db.execute(
@@ -976,7 +1058,7 @@ async def resume_deal(call: CallbackQuery):
 
 # ---------------------------------------------------------------------------
 # Startup / shutdown
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 
 async def main():
     logger.info("THE GIFT GUARANTOR запущен")
